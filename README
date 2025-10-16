@@ -1,0 +1,51 @@
+Use Case 1 — Normal traffic
+
+From web:
+mysql -h 10.0.1.20 -u root -p
+✅ Works (port 3306 allowed)
+
+
+From web trying to SSH db:
+ssh vagrant@10.0.1.20
+❌ Blocked by firewall
+
+Use Case 2 — Snort IDS detection
+On fw:
+sudo tail -f /var/log/syslog | grep snort
+
+Then from web:
+nmap -p 1-1024 10.0.1.20
+✅ Snort will log scanning activity (if rule matches).
+
+
+
+## Introduction à Vagrant
+# Vagrant.configure("2") do |config|
+#     servers=[
+#         {
+#           :hostname => "control",
+#           :box => "bento/ubuntu-18.04",
+#           :ip => "172.16.1.50",
+#           :ssh_port => '2200'
+#         },
+#         {
+#           :hostname => "node1",
+#           :box => "bento/ubuntu-18.04",
+#           :ip => "172.16.1.52",
+#           :ssh_port => '2202'
+#         }
+#       ]
+
+#     servers.each do |machine|
+#         config.vm.define machine[:hostname] do |node|
+#             node.vm.box = machine[:box]
+#             node.vm.hostname = machine[:hostname]
+#             node.vm.network :private_network, ip: machine[:ip]
+#             node.vm.network "forwarded_port", guest: 22, host: machine[:ssh_port], id: "ssh"
+#             node.vm.provider :virtualbox do |vb|
+#                 vb.customize ["modifyvm", :id, "--memory", 512]
+#                 vb.customize ["modifyvm", :id, "--cpus", 1]
+#             end
+#         end
+#     end
+# end
