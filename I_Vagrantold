@@ -26,6 +26,25 @@ Vagrant.configure("2") do |config|
       sed -i 's/#net.ipv4.ip_forward=1/net.ipv4.ip_forward=1/' /etc/sysctl.conf
       sysctl -p
 
+      # Configure netplan for interfaces
+      cat > /etc/netplan/01-netcfg.yaml <<EOF
+network:
+  version: 2
+  ethernets:
+    eth0:
+      dhcp4: true
+    eth1:
+      addresses:
+        - 10.0.0.1/24
+    eth2:
+      addresses:
+        - 10.0.1.1/24
+    eth3:
+      addresses:
+        - 10.0.2.1/24
+EOF
+      netplan apply
+
       iptables -F
       iptables -t nat -F
       iptables -X
@@ -43,10 +62,18 @@ Vagrant.configure("2") do |config|
       iptables -A FORWARD -s 10.0.2.0/24 -d 10.0.0.0/16 -m state --state NEW,ESTABLISHED -j ACCEPT
       iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
 
+
+      # NAT for internet access
+      iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+
       iptables -N LOGDROP
       iptables -A LOGDROP -j LOG --log-prefix "FW_DROP: " --log-level 4
       iptables -A LOGDROP -j DROP
       iptables -A FORWARD -j LOGDROP
+
+      # Debugging: Log accepted traffic
+      iptables -A FORWARD -s 10.0.0.10 -d 10.0.1.20 -j LOG --log-prefix "WEB_TO_DB: "
+      iptables -A FORWARD -s 10.0.1.20 -d 10.0.0.10 -j LOG --log-prefix "DB_TO_WEB: "
 
       netfilter-persistent save
 
@@ -74,7 +101,7 @@ Vagrant.configure("2") do |config|
 
     web.vm.provision "shell", inline: <<-SHELL
       apt-get update -y
-      apt-get install -y docker.io ufw -y
+      apt-get install -y docker.io ufw mysql-client -y
       systemctl enable docker
       systemctl start docker
       ufw --force reset
@@ -83,6 +110,8 @@ Vagrant.configure("2") do |config|
       ufw allow 80/tcp
       ufw allow from 10.0.1.0/24 to any port 3306
       ufw enable
+
+      netplan apply
       docker run -d --name demo-nginx -p 80:80 nginx
     SHELL
   end
@@ -102,13 +131,27 @@ Vagrant.configure("2") do |config|
       apt-get update -y
       apt-get install -y mysql-server ufw -y
       systemctl enable mysql
+      sed -i 's/bind-address.*=.*127.0.0.1/bind-address = 0.0.0.0/' /etc/mysql/mysql.conf.d/mysqld.cnf
+      systemctl restart mysql
       ufw --force reset
       ufw default deny incoming
       ufw default allow outgoing
-      ufw allow from 10.0.0.1 to any port 3306
+      ufw allow from 10.0.0.10 to any port 3306
       ufw allow from 10.0.2.0/24 to any port 22
       ufw enable
       echo "CREATE DATABASE IF NOT EXISTS labdb;" | mysql -u root || true
+
+      # Configure netplan for persistent routing
+      cat > /etc/netplan/01-netcfg.yaml <<EOF
+network:
+  version: 2
+  ethernets:
+    eth0:
+      addresses:
+        - 10.0.1.20/24
+      gateway4: 10.0.1.1
+EOF
+      netplan apply
     SHELL
   end
 
@@ -126,6 +169,17 @@ Vagrant.configure("2") do |config|
     admin.vm.provision "shell", inline: <<-SHELL
       apt-get update -y
       apt-get install -y nmap curl net-tools sshpass -y
+      # Configure netplan for persistent routing
+      cat > /etc/netplan/01-netcfg.yaml <<EOF
+network:
+  version: 2
+  ethernets:
+    eth0:
+      addresses:
+        - 10.0.2.100/24
+      gateway4: 10.0.2.1
+EOF
+      netplan apply
       echo "Admin tools installed"
     SHELL
   end
@@ -148,8 +202,6 @@ Vagrant.configure("2") do |config|
         nmap dnsutils net-tools curl wget git \
         nikto gobuster sqlmap netcat-openbsd \
         hashcat htop || true
-
-      apt-get install -y exploitdb || true
 
       mkdir -p /home/vagrant/tools
       chown -R vagrant:vagrant /home/vagrant/tools

@@ -1,51 +1,282 @@
-Use Case 1 — Normal traffic
-
-From web:
-mysql -h 10.0.1.20 -u root -p
-✅ Works (port 3306 allowed)
 
 
-From web trying to SSH db:
-ssh vagrant@10.0.1.20
-❌ Blocked by firewall
+### **Scénarios d'attaques et de menaces**
 
-Use Case 2 — Snort IDS detection
-On fw:
-sudo tail -f /var/log/syslog | grep snort
+#### **1. Attaque par déni de service (DoS) sur le serveur web**
+- **Objectif** : Surcharger le serveur `web` (`10.0.0.10`) pour perturber l'accès au serveur Nginx, le rendant indisponible pour les utilisateurs légitimes.
+- **Méthode d'exécution** :
+  - Depuis la machine `attacker` (`10.0.0.50`), utiliser des outils comme `hping3` ou `slowloris` pour inonder le port 80 du serveur `web` :
+    ```bash
+    sudo hping3 -S -p 80 --flood 10.0.0.10
+    ```
+    - Cela envoie un grand volume de paquets SYN, épuisant les ressources du serveur `web`.
+  - Alternativement, utiliser `slowloris` pour ouvrir plusieurs connexions HTTP et les maintenir ouvertes, consommant ainsi le pool de connexions de Nginx :
+    ```bash
+    slowloris -dns 10.0.0.10 -port 80 -num 500
+    ```
+  - Puisque `attacker` et `web` sont sur le même réseau `dmz_net`, les règles `iptables` du `fw` ne restreignent pas le trafic intra-DMZ, rendant cette attaque réalisable.
+- **Impact potentiel** :
+  - Le serveur Nginx devient inaccessible, empêchant l'accès à l'application web.
+  - Augmentation de l'utilisation du CPU et de la mémoire sur le serveur `web` (512 Mo de RAM peuvent être rapidement épuisés).
+  - Les utilisateurs légitimes (par exemple, depuis `admin` ou via le port forwardé 8080) ne peuvent pas accéder au serveur web.
+- **Stratégies d'atténuation** :
+  - **Limitation de débit sur `fw`** : Ajouter des règles `iptables` pour limiter les connexions au port 80 :
+    ```bash
+    iptables -A FORWARD -s 10.0.0.0/24 -d 10.0.0.10 -p tcp --dport 80 -m connlimit --connlimit-above 20 -j DROP
+    ```
+  - **UFW sur `web`** : Configurer une limitation de débit pour le port 80 :
+    ```bash
+    ufw limit 80/tcp
+    ```
+  - **Snort sur `fw`** : Mettre à jour les règles Snort pour détecter et bloquer les attaques par inondation :
+    ```bash
+    echo "alert tcp 10.0.0.50 any -> 10.0.0.10 80 (msg:\"Inondation SYN détectée\"; flags:S; threshold: type both, track by_src, count 100, seconds 10; sid:1000001;)" >> /etc/snort/rules/local.rules
+    systemctl restart snort
+    ```
+  - **Augmenter les ressources** : Allouer plus de RAM/CPU au serveur `web` (par exemple, 1024 Mo) dans le Vagrantfile :
+    ```ruby
+    vb.customize ["modifyvm", :id, "--memory", "1024"]
+    ```
+  - **Protection DDoS** : Dans un environnement de production, déployer un proxy inverse (par exemple, Cloudflare) ou un middleware de limitation de débit dans Nginx.
 
-Then from web:
-nmap -p 1-1024 10.0.1.20
-✅ Snort will log scanning activity (if rule matches).
+#### **2. Injection SQL sur la connexion web vers la base de données**
+- **Objectif** : Exploiter les vulnérabilités de l'application web sur `web` pour manipuler ou extraire des données de la base de données MySQL du serveur `db` (`10.0.1.20:3306`).
+- **Méthode d'exécution** :
+  - Depuis la machine `attacker`, utiliser `sqlmap` pour sonder l'application web à la recherche de vulnérabilités d'injection SQL :
+    ```bash
+    sqlmap -u "http://10.0.0.10/index.php?id=1" --dbs
+    ```
+  - Si l'application web (Nginx sur `web`) se connecte au serveur MySQL de `db` (par exemple, avec `webuser` et le mot de passe `securepassword`), une application mal codée pourrait permettre :
+    - L'extraction de la base de données `labdb`.
+    - L'exécution de requêtes SQL arbitraires (par exemple, `SELECT * FROM users WHERE id = '1' OR '1'='1'`).
+  - Les règles `iptables` sur `fw` autorisent le trafic de `web` vers `db` sur le port 3306, donc un serveur `web` compromis pourrait amplifier cette attaque.
+- **Impact potentiel** :
+  - Accès non autorisé aux données sensibles dans `labdb`.
+  - Possibilité de modifier ou supprimer le contenu de la base de données.
+  - Si `webuser` a des privilèges excessifs, un attaquant pourrait escalader vers un accès administratif sur `db`.
+- **Stratégies d'atténuation** :
+  - **Sécuriser l'application web** : S'assurer que l'application web utilise des requêtes préparées ou paramétrées pour empêcher l'injection SQL.
+  - **Privilèges minimaux pour l'utilisateur MySQL** : Limiter les privilèges de `webuser` sur `db` :
+    ```bash
+    vagrant ssh db
+    mysql -u root
+    REVOKE ALL PRIVILEGES ON labdb.* FROM 'webuser'@'10.0.0.10';
+    GRANT SELECT, INSERT, UPDATE ON labdb.* TO 'webuser'@'10.0.0.10';
+    FLUSH PRIVILEGES;
+    ```
+  - **Détection d'injection SQL avec Snort** : Ajouter une règle pour détecter les tentatives d'injection SQL :
+    ```bash
+    echo "alert tcp 10.0.0.10 any -> 10.0.1.20 3306 (msg:\"Tentative d'injection SQL\"; content:\"1=1\"; sid:1000002;)" >> /etc/snort/rules/local.rules
+    systemctl restart snort
+    ```
+  - **Pare-feu d'application web (WAF)** : Installer `modsecurity` sur Nginx du serveur `web` pour filtrer les requêtes malveillantes :
+    ```bash
+    vagrant ssh web
+    sudo apt-get install -y libnginx-mod-security
+    ```
+  - **Sauvegardes régulières** : Configurer des sauvegardes MySQL sur `db` :
+    ```bash
+    mysqldump -u root labdb > /backups/labdb.sql
+    ```
 
+#### **3. Escalade de privilèges via une mauvaise configuration SSH**
+- **Objectif** : Obtenir un accès non autorisé au serveur `db` (`10.0.1.20`) en exploitant des identifiants SSH faibles ou des erreurs de configuration depuis la machine `attacker` ou un serveur `web` compromis.
+- **Méthode d'exécution** :
+  - Le Vagrantfile autorise SSH depuis `web` (`10.0.0.10`) et `mgmt_net` (`10.0.2.0/24`) vers `db` sur le port 22. Si le serveur `web` est compromis (par exemple, via une vulnérabilité web), un attaquant pourrait :
+    - Utiliser `hashcat` pour casser des mots de passe SSH faibles (par exemple, `vagrant`) :
+      ```bash
+      vagrant ssh attacker
+      sshpass -p "vagrant" ssh vagrant@10.0.1.20
+      ```
+    - Ou exploiter la clé SSH par défaut de Vagrant (`insecure_private_key`) si elle n'a pas été modifiée.
+  - Alternativement, la machine `attacker` pourrait tenter de forcer brutalement SSH sur `db` si les règles `iptables` sont relâchées pour permettre le trafic de `10.0.0.50` vers `10.0.1.20:22`.
+- **Impact potentiel** :
+  - Accès non autorisé au serveur `db`, permettant l'exécution de commandes arbitraires.
+  - Accès à MySQL en tant que `root` (si aucun mot de passe n'est défini) ou à d'autres fichiers sensibles.
+  - Possibilité de pivoter vers d'autres machines (par exemple, `admin`) si les clés SSH sont réutilisées.
+- **Stratégies d'atténuation** :
+  - **Désactiver l'authentification par mot de passe SSH** : Configurer `db` pour utiliser uniquement l'authentification par clé :
+    ```bash
+    vagrant ssh db
+    sudo sed -i 's/PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
+    sudo systemctl restart ssh
+    ```
+    - Distribuer les clés SSH de manière sécurisée depuis `admin` ou `web` si nécessaire.
+  - **Restreindre l'accès SSH** : Mettre à jour `ufw` sur `db` pour autoriser SSH uniquement depuis `admin` (`10.0.2.100`) :
+    ```bash
+    ufw delete allow from 10.0.0.10 to any port 22
+    ufw allow from 10.0.2.100 to any port 22
+    ```
+  - **Règles de pare-feu sur `fw`** : Supprimer le transfert SSH de `web` vers `db` si non nécessaire :
+    ```bash
+    iptables -D FORWARD -s 10.0.0.10 -d 10.0.1.20 -p tcp --dport 22 -m state --state NEW,ESTABLISHED -j ACCEPT
+    iptables -D FORWARD -s 10.0.1.20 -d 10.0.0.10 -p tcp --sport 22 -m state --state ESTABLISHED -j ACCEPT
+    ```
+  - **Changer les identifiants par défaut** : Remplacer la clé SSH par défaut de Vagrant et le mot de passe :
+    ```ruby
+    config.ssh.insert_key = true
+    ```
 
+#### **4. Balayage et énumération du réseau**
+- **Objectif** : Cartographier la topologie du réseau et identifier les vulnérabilités dans `dmz_net` et potentiellement d'autres réseaux si le `fw` est mal configuré.
+- **Méthode d'exécution** :
+  - Depuis la machine `attacker`, utiliser `nmap` pour balayer `dmz_net` :
+    ```bash
+    vagrant ssh attacker
+    nmap -sP 10.0.0.0/24
+    nmap -sV -p- 10.0.0.10
+    ```
+    - Découvre le serveur `web` (`10.0.0.10`) exécutant Nginx sur le port 80 et le serveur `fw` (`10.0.0.1`) avec SSH sur le port 22 (depuis `mgmt_net`).
+  - Si les règles de `fw` sont mal configurées pour permettre le trafic de `10.0.0.50` vers `int_net` ou `mgmt_net`, balayer ces réseaux :
+    ```bash
+    nmap -sP 10.0.1.0/24
+    nmap -sP 10.0.2.0/24
+    ```
+  - Utiliser `nikto` ou `gobuster` pour énumérer le serveur web :
+    ```bash
+    nikto -h http://10.0.0.10
+    gobuster dir -u http://10.0.0.10 -w /usr/share/wordlists/dirb/common.txt
+    ```
+- **Impact potentiel** :
+  - Révèle les ports ouverts, les services et les vulnérabilités potentielles (par exemple, versions obsolètes de Nginx).
+  - Identifie les règles de pare-feu mal configurées permettant l'accès à `int_net` ou `mgmt_net`.
+  - Fournit une base pour d'autres attaques (par exemple, exploiter des vulnérabilités web).
+- **Stratégies d'atténuation** :
+  - **Renforcer les règles de pare-feu** : S'assurer que `iptables` sur `fw` bloque l'accès non autorisé depuis `attacker` vers `int_net` et `mgmt_net` :
+    ```bash
+    iptables -A FORWARD -s 10.0.0.50 -d 10.0.1.0/24 -j DROP
+    iptables -A FORWARD -s 10.0.0.50 -d 10.0.2.0/24 -j DROP
+    ```
+  - **Surveillance Snort** : Configurer Snort pour détecter les balayages :
+    ```bash
+    echo "alert ip 10.0.0.50 any -> 10.0.0.0/16 any (msg:\"Balayage réseau détecté\"; sid:1000003;)" >> /etc/snort/rules/local.rules
+    systemctl restart snort
+    ```
+  - **Renforcer le serveur web** : Maintenir Nginx à jour et supprimer les fichiers/répertoires inutiles :
+    ```bash
+    vagrant ssh web
+    sudo apt-get upgrade nginx
+    ```
+  - **Désactiver les ports inutiles** : Utiliser `ufw` pour restreindre les ports sur `web` et `fw` :
+    ```bash
+    vagrant ssh web
+    ufw deny 22
+    ```
 
-## Introduction à Vagrant
-# Vagrant.configure("2") do |config|
-#     servers=[
-#         {
-#           :hostname => "control",
-#           :box => "bento/ubuntu-18.04",
-#           :ip => "172.16.1.50",
-#           :ssh_port => '2200'
-#         },
-#         {
-#           :hostname => "node1",
-#           :box => "bento/ubuntu-18.04",
-#           :ip => "172.16.1.52",
-#           :ssh_port => '2202'
-#         }
-#       ]
+#### **5. Attaque de type Man-in-the-Middle (MITM) via empoisonnement ARP**
+- **Objectif** : Intercepter le trafic entre `web` et `db` ou au sein de `dmz_net` en falsifiant les réponses ARP.
+- **Méthode d'exécution** :
+  - Depuis la machine `attacker`, utiliser `arpspoof` pour empoisonner les caches ARP sur `dmz_net` :
+    ```bash
+    vagrant ssh attacker
+    sudo apt-get install -y dsniff
+    arpspoof -i eth0 -t 10.0.0.10 -r 10.0.0.1
+    ```
+    - Trompe le serveur `web` (`10.0.0.10`) pour qu'il envoie le trafic à `attacker` (`10.0.0.50`) au lieu de `fw` (`10.0.0.1`).
+  - Capturer le trafic avec `tcpdump` ou `wireshark` :
+    ```bash
+    tcpdump -i eth0 host 10.0.0.10 and host 10.0.1.20 -w mitm.pcap
+    ```
+    - Si `web` envoie des identifiants MySQL non chiffrés à `db`, ils pourraient être capturés.
+- **Impact potentiel** :
+  - Exposition des identifiants MySQL (`webuser:securepassword`).
+  - Interception des données sensibles entre `web` et `db`.
+  - Possibilité de modifier le trafic (par exemple, injecter des requêtes SQL malveillantes).
+- **Stratégies d'atténuation** :
+  - **Entrées ARP statiques** : Sur `web` et `fw`, définir des entrées ARP statiques :
+    ```bash
+    vagrant ssh web
+    sudo arp -s 10.0.0.1 08:00:27:dc:33:59
+    vagrant ssh fw
+    sudo arp -s 10.0.0.10 08:00:27:9c:51:88
+    ```
+    - Remplacer les adresses MAC par les valeurs réelles obtenues avec `ip link show` sur chaque machine.
+  - **Activer une communication sécurisée** : Utiliser SSL/TLS pour les connexions MySQL :
+    ```bash
+    vagrant ssh db
+    mysql -u root
+    GRANT ALL PRIVILEGES ON labdb.* TO 'webuser'@'10.0.0.10' IDENTIFIED BY 'securepassword' REQUIRE SSL;
+    ```
+  - **Détection Snort** : Ajouter une règle pour détecter l'empoisonnement ARP :
+    ```bash
+    echo "alert arp any any -> any any (msg:\"Empoisonnement ARP détecté\"; arp.sender.mac != arp.sender.ip; sid:1000004;)" >> /etc/snort/rules/local.rules
+    systemctl restart snort
+    ```
+  - **Segmentation du réseau** : S'assurer que `attacker` ne peut pas atteindre `int_net` ou `mgmt_net`.
 
-#     servers.each do |machine|
-#         config.vm.define machine[:hostname] do |node|
-#             node.vm.box = machine[:box]
-#             node.vm.hostname = machine[:hostname]
-#             node.vm.network :private_network, ip: machine[:ip]
-#             node.vm.network "forwarded_port", guest: 22, host: machine[:ssh_port], id: "ssh"
-#             node.vm.provider :virtualbox do |vb|
-#                 vb.customize ["modifyvm", :id, "--memory", 512]
-#                 vb.customize ["modifyvm", :id, "--cpus", 1]
-#             end
-#         end
-#     end
-# end
+---
+
+### **Recommandations générales d'atténuation**
+
+1. **Gestion des correctifs** :
+   - Mettre à jour régulièrement toutes les machines :
+     ```bash
+     apt-get update && apt-get upgrade -y
+     ```
+   - Vérifier les versions vulnérables de Nginx, MySQL et autres services.
+
+2. **Surveillance et journalisation** :
+   - Activer la journalisation détaillée sur `fw` pour tout le trafic :
+     ```bash
+     iptables -A FORWARD -j LOG --log-prefix "ALL_TRAFFIC: "
+     ```
+   - Surveiller les alertes Snort : `tail -f /var/log/snort/alert`.
+
+3. **Renforcement du réseau** :
+   - Vérifier l'isolation de `virtualbox__intnet` dans l'interface graphique de VirtualBox.
+   - Restreindre l'accès de la machine `attacker` aux services nécessaires uniquement (par exemple, port 80 sur `web`).
+
+4. **Sauvegarde et récupération** :
+   - Mettre en place des sauvegardes régulières pour `db` et `web` :
+     ```bash
+     vagrant ssh db
+     mysqldump -u root labdb > /backups/labdb-$(date +%F).sql
+     vagrant ssh web
+     tar -czf /backups/nginx-$(date +%F).tar.gz /etc/nginx
+     ```
+
+5. **Tests de sécurité** :
+   - Utiliser la machine `attacker` pour tester périodiquement l'environnement :
+     ```bash
+     vagrant ssh attacker
+     nmap -sV 10.0.0.10
+     nikto -h http://10.0.0.10
+     sqlmap -u http://10.0.0.10 --dbs
+     ```
+
+---
+
+### **Test des scénarios**
+
+Pour simuler ces attaques et tester les atténuations :
+1. **Attaque DoS** :
+   - Exécuter `hping3` depuis `attacker` et surveiller l'utilisation des ressources du serveur `web` :
+     ```bash
+     vagrant ssh web
+     htop
+     ```
+   - Vérifier les alertes Snort sur `fw` : `tail -f /var/log/snort/alert`.
+2. **Injection SQL** :
+   - Déployer une application web vulnérable sur `web` (par exemple, DVWA) et tester avec `sqlmap`.
+   - Vérifier que Snort détecte les tentatives.
+3. **Attaque SSH** :
+   - Tenter un accès SSH depuis `attacker` vers `db` (devrait échouer en raison des règles `iptables`).
+   - Tester depuis `web` avec des identifiants incorrects et vérifier les journaux `ufw` sur `db`.
+4. **Balayage réseau** :
+   - Exécuter `nmap` depuis `attacker` et vérifier que `fw` bloque les balayages vers `int_net`/`mgmt_net`.
+5. **Attaque MITM** :
+   - Exécuter `arpspoof` et vérifier si le trafic de `web` est redirigé.
+   - Vérifier que les entrées ARP statiques empêchent l'empoisonnement.
+
+---
+
+### **Résumé**
+
+Les scénarios d'attaques proposés incluent :
+- **DoS** : Inondation du serveur `web` pour perturber Nginx.
+- **Injection SQL** : Exploitation de la connexion `web` vers `db` MySQL.
+- **Escalade de privilèges** : Abus de l'accès SSH à `db`.
+- **Balayage réseau** : Cartographie du réseau pour trouver des vulnérabilités.
+- **MITM** : Interception du trafic via empoisonnement ARP.
+
+Les atténuations se concentrent sur le renforcement des règles de pare-feu, la sécurisation des services, l'activation de la détection Snort et le durcissement des configurations réseau. Mettez à jour le Vagrantfile avec les règles fournies et testez chaque scénario depuis la machine `attacker` pour vous assurer que les défenses tiennent. Si vous souhaitez simuler une attaque spécifique ou besoin d'aide pour mettre en œuvre une atténuation, faites-le-moi savoir !

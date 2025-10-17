@@ -1,0 +1,49 @@
+graph TD
+    subgraph Host["Hôte  Machine Physique "]
+        VagrantDir["/vagrant/backups<br> Sauvegardes: fw, web, db, admin "]
+    end
+
+    subgraph Internet["Internet"]
+        Ext["Passerelle NAT<br> 8.8.8.8, etc. "]
+    end
+
+    subgraph DMZ["dmz_net  10.0.0.0/24 "]
+        Web["web<br>IP: 10.0.0.10<br>Nginx: 80<br>Sauvegardes: /vagrant/backups/web"]
+        Attacker["attacker<br>IP: 10.0.0.50<br>Outils: nmap, sqlmap, etc."]
+    end
+
+    subgraph Internal["int_net  10.0.1.0/24 "]
+        DB["db<br>IP: 10.0.1.20<br>MySQL: 3306<br>Sauvegardes: /vagrant/backups/db"]
+    end
+
+    subgraph Management["mgmt_net  10.0.2.0/24 "]
+        Admin["admin<br>IP: 10.0.2.100<br>Outils: nmap, sshpass<br>Sauvegardes: /vagrant/backups/admin"]
+    end
+
+    subgraph Firewall["fw  Passerelle "]
+        FW["fw<br>eth0: NAT  DHCP <br>eth1: 10.0.0.1  dmz_net <br>eth2: 10.0.1.1  int_net <br>eth3: 10.0.2.1  mgmt_net <br>iptables, Snort<br>Sauvegardes: /vagrant/backups/fw"]
+    end
+
+    %% Connexions réseau
+    FW -->|NAT  eth0 | Ext
+    Web -->|Passerelle: 10.0.0.1| FW
+    Attacker -->|Passerelle: 10.0.0.1| FW
+    DB -->|Passerelle: 10.0.1.1| FW
+    Admin -->|Passerelle: 10.0.2.1| FW
+
+    %% Flux de communication
+    Web -->|MySQL  3306 | DB
+    Web -->|ICMP| DB
+    DB -->|ICMP| Web
+    Web -->|SSH  22 | DB
+    Admin -->|SSH  22 | Web
+    Admin -->|SSH  22 | DB
+    Attacker -->|HTTP  80 | Web
+    Attacker -.-x|Bloqué par iptables| DB
+    Attacker -.-x|Bloqué par iptables| Admin
+
+    %% Sauvegardes
+    FW -->|Sauvegardes| VagrantDir
+    Web -->|Sauvegardes| VagrantDir
+    DB -->|Sauvegardes| VagrantDir
+    Admin -->|Sauvegardes| VagrantDir
